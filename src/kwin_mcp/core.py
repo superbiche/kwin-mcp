@@ -7,16 +7,17 @@ Can be used directly from the CLI or wrapped by the MCP server.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 from kwin_mcp.input import InputBackend, MouseButton
+from kwin_mcp.processes import process_running, stop_processes
 from kwin_mcp.screenshot import capture_frame_burst, capture_screenshot_to_file
 from kwin_mcp.session import LiveSession, Session, SessionConfig
 
@@ -79,12 +80,14 @@ class AutomationEngine:
     def _session_env(self) -> dict[str, str]:
         """Build environment dict for tools that need the isolated session."""
         session = self._get_session()
-        env = {**os.environ}
+        env: dict[str, str] = {**os.environ}
         info = session.info
         if info:
             if info.dbus_address:
                 env["DBUS_SESSION_BUS_ADDRESS"] = info.dbus_address
             env["WAYLAND_DISPLAY"] = info.wayland_socket
+            if info.runtime_dir:
+                env["XDG_RUNTIME_DIR"] = info.runtime_dir
             if info.home_dir:
                 home = str(info.home_dir)
                 env["HOME"] = home
@@ -94,6 +97,7 @@ class AutomationEngine:
                 env["XDG_STATE_HOME"] = str(info.home_dir / ".local" / "state")
         env["QT_QPA_PLATFORM"] = "wayland"
         env.pop("DISPLAY", None)
+        env.pop("WAYLAND_SOCKET", None)
         return env
 
     def _run_atspi(self, op: str, **kwargs: object) -> dict:
@@ -182,6 +186,7 @@ class AutomationEngine:
         if self._session is not None and self._session.is_running:
             return "Session already running. Call session_stop first."
 
+        self.session_stop()
         self._clipboard_enabled = enable_clipboard
 
         self._session = Session()
@@ -193,29 +198,35 @@ class AutomationEngine:
             isolate_home=isolate_home,
             keep_home=keep_home,
         )
-        info = self._session.start(config)
-
-        result = f"Session started. Wayland socket: {info.wayland_socket}"
-        if info.home_dir:
-            result += f"\nIsolated home: {info.home_dir}"
-
-        if app_command:
-            cmd = shlex.split(app_command)
-            app_info = self._session.launch_app(cmd, extra_env=env)
-            result += f"\nApp launched: {app_command} (PID={app_info.pid})"
-            result += f"\nApp log: {app_info.log_path}"
-
-        # Set up input backend via KWin's EIS D-Bus interface
-        time.sleep(0.5)
         try:
-            self._input = InputBackend(info.dbus_address)
-        except RuntimeError:
-            self._input = None
+            info = self._session.start(config)
 
-        input_status = "Input backend: KWin EIS" if self._input else "No input backend available"
-        result += f"\n{input_status}"
+            result = f"Session started. Wayland socket: {info.wayland_socket}"
+            if info.home_dir:
+                result += f"\nIsolated home: {info.home_dir}"
 
-        return result
+            if app_command:
+                cmd = shlex.split(app_command)
+                app_info = self._session.launch_app(cmd, extra_env=env)
+                result += f"\nApp launched: {app_command} (PID={app_info.pid})"
+                result += f"\nApp log: {app_info.log_path}"
+
+            # Set up input backend via KWin's EIS D-Bus interface
+            time.sleep(0.5)
+            try:
+                self._input = InputBackend(info.dbus_address)
+            except RuntimeError:
+                self._input = None
+
+            input_status = (
+                "Input backend: KWin EIS" if self._input else "No input backend available"
+            )
+            result += f"\n{input_status}"
+
+            return result
+        except BaseException:
+            self.session_stop()
+            raise
 
     def session_connect(
         self,
@@ -241,19 +252,32 @@ class AutomationEngine:
                 "or ensure $WAYLAND_DISPLAY is set."
             )
 
+        if (
+            dbus_addr != os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+            and not Path(wayland_disp).is_absolute()
+        ):
+            return (
+                "A foreign D-Bus session requires an absolute Wayland socket path; "
+                "a relative display could target the host compositor."
+            )
+
         # Validate KWin is reachable on the given D-Bus
         import dbus as dbus_module
         import dbus.bus
 
+        bus = None
         try:
             bus = dbus.bus.BusConnection(dbus_addr)
-            bus.get_object("org.kde.KWin", "/org/kde/KWin")
+            if not bus.name_has_owner("org.kde.KWin"):
+                return f"KWin is not running on D-Bus ({dbus_addr})."
         except dbus_module.DBusException as exc:
             return f"Cannot reach KWin on D-Bus ({dbus_addr}): {exc}"
+        finally:
+            if bus is not None:
+                bus.close()
 
-        screenshot_dir = Path(tempfile.mkdtemp(prefix="kwin-mcp-screenshots-"))
-
-        session = LiveSession(dbus_addr, wayland_disp, screenshot_dir)
+        self.session_stop()
+        session = LiveSession(dbus_addr, wayland_disp)
         session._keep_screenshots = keep_screenshots
         self._session = session
         self._keep_screenshots = keep_screenshots
@@ -263,51 +287,64 @@ class AutomationEngine:
 
         result = f"Connected to live KWin session. D-Bus: {dbus_addr}, Wayland: {wayland_disp}"
 
-        # Set up input backend — EIS first, ydotool fallback
-        time.sleep(0.3)
         try:
-            self._input = InputBackend(dbus_addr)
-            result += "\nInput backend: KWin EIS"
-        except RuntimeError:
-            self._input = None
-            if shutil.which("ydotool"):
-                result += "\nInput backend: ydotool (EIS unavailable)"
-            else:
-                result += (
-                    "\nNo input backend available (EIS connection failed and ydotool not found). "
-                    "Screenshot and accessibility tools still work."
-                )
-
-        return result
-
-    def session_stop(self) -> str:
-        """Stop the current session and clean up."""
-        if self._session is None:
-            return "No session running."
-
-        # Clean up wl-copy process if active
-        if self._wl_copy_proc is not None:
-            self._wl_copy_proc.terminate()
+            time.sleep(0.3)
             try:
-                self._wl_copy_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._wl_copy_proc.kill()
+                self._input = InputBackend(dbus_addr)
+                result += "\nInput backend: KWin EIS"
+            except RuntimeError:
+                self._input = None
+                result += "\nNo input backend available. Screenshot and accessibility still work."
+            return result
+        except BaseException:
+            self.session_stop()
+            raise
+
+    def _stop_clipboard(self) -> None:
+        if self._wl_copy_proc is not None:
+            stop_processes([self._wl_copy_proc])
             self._wl_copy_proc = None
+
+    def session_stop(self, grace_seconds: float = 5.0) -> str:
+        """Stop owned resources; allow apps up to grace_seconds before SIGKILL."""
+        if not math.isfinite(grace_seconds) or not 0 <= grace_seconds <= 60:
+            raise ValueError("grace_seconds must be finite and between 0 and 60")
+        session = self._session
+        errors: list[Exception] = []
         self._clipboard_enabled = False
-
+        try:
+            self._stop_clipboard()
+        except Exception as exc:
+            errors.append(exc)
         if self._input is not None:
-            self._input.close()
-
-        is_live = isinstance(self._session, LiveSession)
-        if isinstance(self._session, LiveSession):
-            self._session.stop(keep_screenshots=self._keep_screenshots)
-        else:
-            self._session.stop()
-        self._session = None
-        self._input = None
+            try:
+                self._input.close()
+            except Exception as exc:
+                errors.append(exc)
+            else:
+                self._input = None
+        if session is not None:
+            try:
+                if isinstance(session, LiveSession):
+                    session.stop(
+                        keep_screenshots=self._keep_screenshots, grace_seconds=grace_seconds
+                    )
+                else:
+                    session.stop(grace_seconds=grace_seconds)
+            except Exception as exc:
+                errors.append(exc)
+            else:
+                self._session = None
+        if errors:
+            raise ExceptionGroup("Session cleanup failed", errors)
         self._keep_screenshots = False
-
-        return "Disconnected from live session." if is_live else "Session stopped."
+        if session is None:
+            return "No session running."
+        return (
+            "Disconnected from live session."
+            if isinstance(session, LiveSession)
+            else ("Session stopped.")
+        )
 
     # ── Screenshot / Accessibility ────────────────────────────────────────
 
@@ -491,18 +528,34 @@ class AutomationEngine:
         screenshot_after_ms: list[int] | None = None,
     ) -> str:
         """Type arbitrary Unicode text including non-ASCII characters."""
-        if not shutil.which("wtype") and not shutil.which("wl-copy"):
-            return (
-                "Neither wtype nor wl-copy found. Install at least one: "
-                "wtype (e.g. 'sudo pacman -S wtype') or "
-                "wl-clipboard (e.g. 'sudo pacman -S wl-clipboard')."
-            )
+        env = self._session_env()
+        if shutil.which("wtype"):
+            try:
+                completed = subprocess.run(
+                    ["wtype", "--", text],
+                    env=env,
+                    capture_output=True,
+                    timeout=5,
+                )
+            except subprocess.TimeoutExpired:
+                # Input may be partial: never paste a second copy after a timeout.
+                return "Unicode input timed out; text may have been partially entered."
+            except FileNotFoundError:
+                pass
+            else:
+                if completed.returncode == 0:
+                    return self._with_frame_capture(f"Typed unicode: {text!r}", screenshot_after_ms)
+                # wtype reports this before injecting any input on unsupported compositors.
+                if b"does not support the virtual keyboard protocol" not in completed.stderr:
+                    return "Unicode input failed; no clipboard retry because input may be partial."
+        if not self._clipboard_enabled:
+            return "Unicode input requires wtype support or enable_clipboard=True."
         inp = self._get_input()
-        session = self._get_session()
-        dbus_addr = session.info.dbus_address if session.info else None
-        ok = inp.keyboard_type_unicode(text, dbus_address=dbus_addr)
-        result = f"Typed unicode: {text!r}" if ok else f"Failed to type unicode: {text!r}"
-        return self._with_frame_capture(result, screenshot_after_ms)
+        clipboard_result = self.clipboard_set(text)
+        if not clipboard_result.startswith("Clipboard set:"):
+            return clipboard_result
+        inp.keyboard_key("ctrl+v")
+        return self._with_frame_capture(f"Typed unicode: {text!r}", screenshot_after_ms)
 
     def keyboard_key(
         self,
@@ -626,28 +679,38 @@ class AutomationEngine:
                 "or use session_connect (clipboard is always enabled for live sessions)."
             )
 
-        # Terminate previous wl-copy process (replaced by new content)
-        if self._wl_copy_proc is not None:
-            self._wl_copy_proc.terminate()
-            try:
-                self._wl_copy_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._wl_copy_proc.kill()
-            self._wl_copy_proc = None
-
         env = self._session_env()
+        self._stop_clipboard()
         try:
             self._wl_copy_proc = subprocess.Popen(
-                ["wl-copy", "--", text],
+                ["wl-copy", "--foreground", "--", text],
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
         except FileNotFoundError:
             return _INSTALL_HINTS["wl-copy"]
-        time.sleep(0.1)  # Wait for fork to complete
-        return f"Clipboard set: {text!r}"
+        # Confirm the selection is available before allowing Unicode to paste it.
+        deadline = time.monotonic() + 2.0
+        try:
+            while time.monotonic() < deadline:
+                if not process_running(self._wl_copy_proc):
+                    break
+                result = subprocess.run(
+                    ["wl-paste", "--no-newline"],
+                    env=env,
+                    capture_output=True,
+                    timeout=max(0.01, deadline - time.monotonic()),
+                )
+                if result.returncode == 0 and result.stdout == text.encode():
+                    return f"Clipboard set: {text!r}"
+                time.sleep(0.02)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        self._stop_clipboard()
+        return "Failed to set clipboard or confirm its contents (wl-paste is required)."
 
     # ── Wait-for-UI tools ─────────────────────────────────────────────────
 

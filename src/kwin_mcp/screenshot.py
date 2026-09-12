@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import dbus
 import dbus.bus
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def capture_screenshot_to_file(
@@ -16,7 +19,7 @@ def capture_screenshot_to_file(
     wayland_socket: str = "",
     *,
     include_cursor: bool = False,
-    output_dir: Path | None = None,
+    output_dir: Path,
 ) -> Path:
     """Capture a screenshot and save to a file.
 
@@ -24,13 +27,11 @@ def capture_screenshot_to_file(
         dbus_address: D-Bus session bus address for the isolated session.
         wayland_socket: Wayland socket name for the isolated session.
         include_cursor: Whether to include the mouse cursor.
-        output_dir: Directory to save the screenshot. Uses /tmp if not specified.
+        output_dir: Caller-selected directory to save the screenshot.
 
     Returns:
         Absolute path of the saved PNG file.
     """
-    if output_dir is None:
-        output_dir = Path("/tmp")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -255,7 +256,7 @@ def _capture_via_spectacle(
     if include_cursor:
         cmd.append("-p")
 
-    env = {**os.environ}
+    env: dict[str, str] = {**os.environ}
     if dbus_address:
         env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
     if wayland_socket:
@@ -263,6 +264,7 @@ def _capture_via_spectacle(
         env["QT_QPA_PLATFORM"] = "wayland"
     # Remove host display refs
     env.pop("DISPLAY", None)
+    env.pop("WAYLAND_SOCKET", None)
 
     try:
         result = subprocess.run(

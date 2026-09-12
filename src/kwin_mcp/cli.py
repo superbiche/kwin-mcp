@@ -223,9 +223,9 @@ class KwinMcpShell(cmd.Cmd):
     def _cleanup(self) -> None:
         """Clean up session on exit."""
         try:
-            if self.engine._session is not None and self.engine._session.is_running:
+            if self.engine._session is not None:
                 print("Stopping session...")
-                print(self.engine.session_stop())
+            print(self.engine.session_stop())
         except Exception:
             traceback.print_exc()
 
@@ -244,6 +244,7 @@ def main() -> None:
     becomes the recommended session tool.
     """
     import argparse
+    import signal
 
     parser = argparse.ArgumentParser(description="kwin-mcp interactive CLI")
     parser.add_argument(
@@ -254,10 +255,17 @@ def main() -> None:
     args = parser.parse_args()
 
     shell = KwinMcpShell(live_session_mode=args.default_live_session)
+
+    def terminate(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
     try:
         shell.cmdloop()
     except KeyboardInterrupt:
         print("\nInterrupted.")
+    finally:
+        signal.signal(signal.SIGTERM, previous)
         shell._cleanup()
 
 

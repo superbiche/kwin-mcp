@@ -13,13 +13,13 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.util
+import os
 import select
-import shutil
-import subprocess
 import time
 from enum import Enum
 
 import dbus
+import dbus.bus
 from dbus.mainloop.glib import DBusGMainLoop
 
 
@@ -234,14 +234,19 @@ class EISClient:
         DBusGMainLoop(set_as_default=True)
         self._bus = dbus.bus.BusConnection(dbus_address)
         self._ei: int = 0  # ctypes void pointer (int representation)
-        self._cookie: int = 0
+        self._cookie: int | None = None
         self._pointer: int = 0  # absolute pointer device
         self._keyboard: int = 0  # keyboard device
         self._touch_device: int = 0  # touch-capable device
         self._eis_iface: dbus.Interface | None = None
         self._next_touch_id: int = 0  # auto-increment touch ID
         self._active_touches: dict[int, int] = {}  # touch_id -> ctypes pointer
-        self._setup()
+        self._closed = False
+        try:
+            self._setup()
+        except BaseException:
+            self.close()
+            raise
 
     def _setup(self) -> None:
         """Connect to KWin EIS and negotiate devices."""
@@ -264,6 +269,7 @@ class EISClient:
         # Create libei sender context
         self._ei = _libei.ei_new_sender(None)
         if not self._ei:
+            os.close(fd)
             msg = "Failed to create EI context"
             raise RuntimeError(msg)
 
@@ -455,32 +461,33 @@ class EISClient:
 
     def close(self) -> None:
         """Clean up EIS connection."""
+        if self._closed:
+            return
         # Release any lingering touches
         for touch in self._active_touches.values():
             _libei.ei_touch_up(touch)
             _libei.ei_touch_unref(touch)
         self._active_touches.clear()
 
-        if self._touch_device and self._touch_device not in (self._pointer, self._keyboard):
-            _libei.ei_device_stop_emulating(self._touch_device)
-            _libei.ei_device_unref(self._touch_device)
-            self._touch_device = 0
-        if self._pointer:
-            _libei.ei_device_stop_emulating(self._pointer)
-            _libei.ei_device_unref(self._pointer)
-            self._pointer = 0
-        if self._keyboard and self._keyboard != self._pointer:
-            _libei.ei_device_stop_emulating(self._keyboard)
-            _libei.ei_device_unref(self._keyboard)
-            self._keyboard = 0
+        devices = (self._touch_device, self._pointer, self._keyboard)
+        for device in set(devices) - {0}:
+            _libei.ei_device_stop_emulating(device)
+        # _register_device holds one reference for each capability, including aliases.
+        for device in devices:
+            if device:
+                _libei.ei_device_unref(device)
+        self._touch_device = self._pointer = self._keyboard = 0
 
-        if self._eis_iface and self._cookie:
+        if self._eis_iface and self._cookie is not None:
             with contextlib.suppress(dbus.DBusException):
                 self._eis_iface.disconnect(dbus.Int32(self._cookie))
+            self._cookie = None
 
         if self._ei:
             _libei.ei_unref(self._ei)
             self._ei = 0
+        self._bus.close()
+        self._closed = True
 
 
 class InputBackend:
@@ -884,47 +891,6 @@ class InputBackend:
 
         for tid in tids:
             self._client.touch_up(tid)
-
-    def keyboard_type_unicode(self, text: str, dbus_address: str | None = None) -> bool:
-        """Type arbitrary Unicode text using wtype or clipboard fallback.
-
-        Args:
-            text: Text to type (supports non-ASCII, e.g. Korean, CJK).
-            dbus_address: D-Bus address for the session (needed for wl-copy fallback).
-
-        Returns:
-            True if text was typed successfully.
-        """
-        env = dict(__import__("os").environ)
-        if dbus_address:
-            env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
-
-        # Try wtype first
-        if shutil.which("wtype"):
-            result = subprocess.run(
-                ["wtype", "--", text],
-                env=env,
-                capture_output=True,
-                timeout=5,
-            )
-            return result.returncode == 0
-
-        # Fallback: clipboard paste via wl-copy + Ctrl+V
-        # Use Popen + DEVNULL to avoid pipe-blocking from wl-copy's forked child
-        if shutil.which("wl-copy"):
-            cp = subprocess.Popen(
-                ["wl-copy", "--", text],
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(0.1)  # Wait for fork to complete
-            if cp.poll() is None or cp.returncode == 0:
-                self.keyboard_key("ctrl+v")
-                return True
-
-        return False
 
     def close(self) -> None:
         """Close the EIS connection."""

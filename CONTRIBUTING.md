@@ -130,6 +130,7 @@ src/kwin_mcp/
 ├── core.py            # AutomationEngine — MCP-independent automation logic
 ├── server.py          # MCP server (thin wrappers around AutomationEngine)
 ├── cli.py             # Interactive REPL + pipe mode
+├── processes.py       # Owned process-group termination and escalation
 ├── session.py         # KWin session management (isolated virtual + live desktop)
 ├── screenshot.py      # Screenshot capture via KWin ScreenShot2 D-Bus
 ├── accessibility.py   # AT-SPI2 accessibility tree inspection
@@ -175,3 +176,18 @@ scripts/
 ## License
 
 By contributing to kwin-mcp, you agree that your contributions will be licensed under the [MIT License](LICENSE).
+
+### Session safety regression tests
+
+Run `uv run python scripts/test_safety.py -q` (requires `bwrap`). The runner uses
+a read-only host filesystem, private `/tmp`, and private PID/network/IPC namespaces;
+pytest refuses a direct host run. Test files stay under `tmp/safety-tests-*` for
+inspection. Tests use fake input backends and disposable subprocesses;
+they do not attach to the host compositor. They cover selected-display Unicode,
+clipboard opt-in and ownership, startup failure, stdio shutdown, and termination
+of stubborn application descendants while preserving unrelated processes.
+
+For a GUI smoke test, use the CLI with a virtual session, a dedicated application
+profile, and a local test page. Verify actual text entry and screenshots, then
+check that launched processes exit after `session_stop`. Do not substitute a
+live desktop connection for this test.

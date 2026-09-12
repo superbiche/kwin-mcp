@@ -9,16 +9,32 @@ from virtual (isolated) to live (real desktop).
 
 from __future__ import annotations
 
+import os
+import signal
 import sys
-from typing import Annotated
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Annotated
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from kwin_mcp.core import AutomationEngine
 
-mcp = FastMCP("kwin-mcp")
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
 _engine = AutomationEngine()
+
+
+@asynccontextmanager
+async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
+    try:
+        yield None
+    finally:
+        _engine.session_stop()
+
+
+mcp = FastMCP("kwin-mcp", lifespan=_lifespan)
 
 # Detect --default-live-session flag early (before MCP framework consumes args)
 _live_session_mode = "--default-live-session" in sys.argv
@@ -42,7 +58,7 @@ def session_start(
         bool,
         Field(
             description="Enable clipboard tools (wl-copy/wl-paste). Disabled by default "
-            "because wl-copy can hang in isolated sessions."
+            "including the clipboard fallback for Unicode input."
         ),
     ] = False,
     keep_screenshots: Annotated[
@@ -56,7 +72,8 @@ def session_start(
         bool,
         Field(
             description="Create a temporary HOME directory with isolated XDG directories "
-            "(config, data, cache, state). Prevents apps from reading/writing host user settings."
+            "(config, data, cache, state). Redirects normal settings paths, "
+            "without restricting filesystem access."
         ),
     ] = False,
     keep_home: Annotated[
@@ -103,7 +120,7 @@ def session_connect(
         str,
         Field(
             description="Wayland display socket name. Leave empty to use the current desktop "
-            "($WAYLAND_DISPLAY)."
+            "($WAYLAND_DISPLAY). Foreign D-Bus sessions require an absolute socket path."
         ),
     ] = "",
     keep_screenshots: Annotated[
@@ -116,7 +133,7 @@ def session_connect(
     Only use when explicitly asked to interact with a real/existing desktop session.
     For normal GUI automation, use session_start instead (creates an isolated virtual session).
     This connects to a KWin compositor that is already running. Clipboard is always available.
-    Input injection uses KWin EIS when possible, with ydotool as fallback.
+    Input injection requires KWin EIS; other tools remain available if it cannot connect.
     """
     return _engine.session_connect(
         dbus_address=dbus_address,
@@ -126,7 +143,12 @@ def session_connect(
 
 
 @mcp.tool()
-def session_stop() -> str:
+def session_stop(
+    grace_seconds: Annotated[
+        float,
+        Field(ge=0, le=60, description="Seconds to allow launched apps to exit before SIGKILL."),
+    ] = 5.0,
+) -> str:
     """Stop the current session and clean up.
 
     For virtual sessions: terminates KWin, all launched apps, and the D-Bus session.
@@ -134,7 +156,7 @@ def session_stop() -> str:
     Cleans up temporary files and clipboard processes. Safe to call when
     no session is running (returns "No session running.").
     """
-    return _engine.session_stop()
+    return _engine.session_stop(grace_seconds=grace_seconds)
 
 
 # ── Screenshot / Accessibility ───────────────────────────────────────────
@@ -826,8 +848,7 @@ def _apply_live_session_mode() -> None:
         tools["session_connect"].description = (
             "Connect to an existing KWin session (e.g. the real desktop or a container). "
             "This is the default session tool. Connects to a KWin compositor that is already "
-            "running. Clipboard is always available. Input injection uses KWin EIS when "
-            "possible, with ydotool as fallback."
+            "running. Clipboard is always available. Input injection requires KWin EIS."
         )
 
 
@@ -841,7 +862,26 @@ def main() -> None:
     if "--default-live-session" in sys.argv:
         sys.argv.remove("--default-live-session")
     _apply_live_session_mode()
-    mcp.run()
+
+    def terminate(signum: int, _frame: object) -> None:
+        # The SDK's stdin worker can remain blocked while the client holds its pipe
+        # open. Clean up synchronously, then exit without waiting for that worker.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            _engine.session_stop()
+        except Exception:
+            print(
+                "kwin-mcp: cleanup failed; owned resources may remain", file=sys.stderr, flush=True
+            )
+        finally:
+            os._exit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        mcp.run()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        _engine.session_stop()
 
 
 if __name__ == "__main__":

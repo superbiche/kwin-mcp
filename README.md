@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/isac322/kwin-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/isac322/kwin-mcp/actions/workflows/ci.yml)
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI agents (Claude Code, Cursor, and other MCP clients) to launch, interact with, and observe any Wayland application in a fully isolated virtual KWin session -- without affecting the user's desktop. It also supports **live desktop automation** by connecting to an existing KWin session (real desktop or container) for collaborative workflows. With 30 MCP tools covering mouse, keyboard, touch, clipboard, accessibility tree inspection, screenshot capture, and window management, kwin-mcp provides everything needed for end-to-end GUI testing and desktop automation on Linux.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI agents (Claude Code, Cursor, and other MCP clients) to launch, interact with, and observe any Wayland application in a separate virtual KWin session. It also supports **live desktop automation** by connecting to an existing KWin session (real desktop or container) for collaborative workflows. With 30 MCP tools covering mouse, keyboard, touch, clipboard, accessibility tree inspection, screenshot capture, and window management, kwin-mcp provides everything needed for end-to-end GUI testing and desktop automation on Linux.
 
 ## Table of Contents
 
@@ -26,7 +26,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 
 ## Why kwin-mcp?
 
-- **Isolated sessions** -- Each session runs in its own `dbus-run-session` + `kwin_wayland --virtual` sandbox. Your host desktop is never affected.
+- **Isolated sessions** -- Each virtual session uses its own `dbus-run-session` + `kwin_wayland --virtual` compositor. This separates display and input routing; it is not a filesystem or network sandbox.
 - **Live session support** -- Connect to a real KDE Plasma desktop or a KWin instance inside a container (e.g. `systemd-nspawn`) for collaborative "share my screen" workflows.
 - **No screenshots required for interaction** -- The AT-SPI2 accessibility tree gives the AI agent structured widget data (roles, names, coordinates, states, available actions), so it can interact with UI elements without relying solely on vision.
 - **Zero authorization prompts** -- Uses KWin's private EIS (Emulated Input Server) D-Bus interface directly, bypassing the XDG RemoteDesktop portal. No user confirmation dialogs.
@@ -183,9 +183,9 @@ kwin-mcp-cli --default-live-session
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `session_start` | `app_command?` `str`, `screen_width?` `int` (1920), `screen_height?` `int` (1080), `enable_clipboard?` `bool` (false), `keep_screenshots?` `bool` (false), `isolate_home?` `bool` (false), `keep_home?` `bool` (false), `env?` `dict` | Start an isolated KWin Wayland session, optionally launching an app. Set `enable_clipboard=true` to enable clipboard tools (requires `wl-clipboard`). Set `keep_screenshots=true` to preserve screenshot files after `session_stop`. Set `isolate_home=true` to create a temporary HOME with isolated XDG directories (config, data, cache, state), preventing apps from reading/writing host user settings. Set `keep_home=true` to preserve the isolated home directory after `session_stop`. Pass extra environment variables via `env`. |
-| `session_connect` | `dbus_address?` `str`, `wayland_display?` `str`, `keep_screenshots?` `bool` (false) | Connect to an existing KWin session (real desktop or container). Defaults to `$DBUS_SESSION_BUS_ADDRESS` and `$WAYLAND_DISPLAY`. Clipboard is always enabled. `session_stop` only disconnects without killing KWin or pre-existing apps. |
-| `session_stop` | _(none)_ | Stop the session and clean up. For virtual sessions: terminates KWin and all apps. For live sessions: disconnects without killing KWin or pre-existing apps. |
+| `session_start` | `app_command?` `str`, `screen_width?` `int` (1920), `screen_height?` `int` (1080), `enable_clipboard?` `bool` (false), `keep_screenshots?` `bool` (false), `isolate_home?` `bool` (false), `keep_home?` `bool` (false), `env?` `dict` | Start an isolated KWin Wayland session, optionally launching an app. Set `enable_clipboard=true` to enable clipboard tools (requires `wl-clipboard`). Set `keep_screenshots=true` to preserve screenshot files after `session_stop`. Set `isolate_home=true` to create a temporary HOME with isolated XDG directories (config, data, cache, state), redirecting normal settings paths (not restricting filesystem access). Set `keep_home=true` to preserve the isolated home directory after `session_stop`. Pass extra environment variables via `env`. |
+| `session_connect` | `dbus_address?` `str`, `wayland_display?` `str`, `keep_screenshots?` `bool` (false) | Connect to an existing KWin session (real desktop or container). Defaults to `$DBUS_SESSION_BUS_ADDRESS` and `$WAYLAND_DISPLAY`. Clipboard is always enabled; Unicode fallback replaces its contents and does not restore them. A foreign D-Bus session requires an absolute Wayland socket path. `session_stop` only disconnects without killing KWin or pre-existing apps. |
+| `session_stop` | `grace_seconds?` `float` (5, range 0–60) | Stop the session and clean up. Terminates launched applications and their process groups in both modes, allowing the configured grace period before a final group SIGKILL. Virtual sessions also terminate KWin; live sessions leave KWin and pre-existing apps running. |
 
 ### Observation (3 tools)
 
@@ -211,7 +211,7 @@ kwin-mcp-cli --default-live-session
 | Tool | Parameters | Description |
 |------|-----------|-------------|
 | `keyboard_type` | `text` `str`, `screenshot_after_ms?` `list[int]` | Type a string of text character by character (US QWERTY layout) |
-| `keyboard_type_unicode` | `text` `str`, `screenshot_after_ms?` `list[int]` | Type arbitrary Unicode text (Korean, CJK, etc.) via `wtype` or clipboard fallback (`wl-copy` + Ctrl+V). Requires `wtype` or `wl-clipboard` installed. |
+| `keyboard_type_unicode` | `text` `str`, `screenshot_after_ms?` `list[int]` | Type arbitrary Unicode text (Korean, CJK, etc.) via `wtype` or clipboard fallback (`wl-copy` + Ctrl+V). Uses the selected session. Clipboard fallback requires `wl-copy`, `wl-paste`, and clipboard opt-in for virtual sessions; it replaces the selected clipboard content. |
 | `keyboard_key` | `key` `str`, `screenshot_after_ms?` `list[int]` | Press a key or key combination (e.g., `Return`, `ctrl+c`, `alt+F4`, `shift+Tab`) |
 | `keyboard_key_down` | `key` `str` | Press and hold a key without releasing. Useful for holding modifiers across multiple actions (e.g., hold Ctrl while clicking items). |
 | `keyboard_key_up` | `key` `str` | Release a previously held key |
@@ -299,12 +299,12 @@ kwin-mcp server  (30 tools)       kwin-mcp-cli (interactive REPL)
 
 ### Triple Isolation (+ Optional Home Isolation)
 
-kwin-mcp provides three layers of isolation from the host desktop:
+kwin-mcp separates virtual-session routing from the host desktop:
 
 1. **D-Bus isolation** -- `dbus-run-session` creates a private session bus. The isolated session's services (KWin, AT-SPI2, portals) are invisible to the host.
 2. **Display isolation** -- `kwin_wayland --virtual` creates its own Wayland compositor with a virtual framebuffer. No windows appear on the host display.
 3. **Input isolation** -- Input events are injected through KWin's EIS interface into the isolated compositor only. The host desktop receives no input from kwin-mcp.
-4. **Home directory isolation** (optional) -- When `isolate_home=true` is set in `session_start`, a temporary HOME directory is created with isolated XDG directories (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`). Apps in the session cannot read or modify host user settings (e.g. `~/.config/kdeglobals`), improving test reproducibility and safety. `XDG_RUNTIME_DIR` is intentionally not isolated because the Wayland socket resides there.
+4. **Home directory isolation** (optional) -- When `isolate_home=true` is set in `session_start`, a temporary HOME directory is created with isolated XDG directories (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`). This redirects normal configuration paths for reproducibility; apps still have the user's filesystem permissions and can access the original home by absolute path. `XDG_RUNTIME_DIR` is intentionally not isolated because the Wayland socket resides there.
 
 ### Input Injection
 
@@ -322,6 +322,21 @@ The `screenshot` tool captures via the KWin `org.kde.KWin.ScreenShot2` D-Bus int
 ### Accessibility Tree
 
 The AT-SPI2 accessibility bus within the isolated session is queried via PyGObject (`gi.repository.Atspi`). This provides a structured tree of all UI widgets with their roles (button, text field, menu item, etc.), names, states (focused, enabled, visible, etc.), screen coordinates, and available actions (click, toggle, etc.).
+
+### Session lifecycle limits
+
+`session_stop`, CLI exit, and MCP stdio disconnect clean up owned applications and
+clipboard helpers. Group leaders remain unreaped until signalling finishes, so
+shutdown waits the full application grace period (default 5 seconds, configurable
+through `session_stop(grace_seconds=...)`) before a final group SIGKILL. Clipboard
+helper shutdown can add 2 seconds. Choose sufficient grace for application state
+to be saved; the bound can interrupt a still-running application's shutdown. Startup has a bounded handshake and cleans up after failure.
+Applications that deliberately detach into a new process group, use an existing
+application instance, or request user-service activation can outlive this cleanup.
+SIGKILL or a machine crash cannot run cleanup handlers. Shutdown signals during application creation also have a narrow ownership-registration race. Only directories allocated by a session are removed; caller-supplied directories are borrowed. Use a dedicated browser
+profile for experiments; same-user filesystem access and network access remain
+available to launched applications. Clipboard fallback replaces the selection
+and does not restore its previous contents.
 
 ## System Requirements
 
@@ -423,7 +438,7 @@ uv run kwin-mcp
 - **KDE Plasma 6+ required** -- Older KDE versions or other Wayland compositors (GNOME, Sway) are not supported.
 - **AT-SPI2 availability varies** -- Some applications may not fully expose their widget tree via AT-SPI2.
 - **Touch input is EIS-emulated** -- Touch events are emulated through KWin's EIS interface, not from a real touchscreen device. Most applications handle emulated touch correctly, but some may behave differently from physical touch.
-- **Clipboard requires opt-in** -- Clipboard tools (`clipboard_get`, `clipboard_set`) are disabled by default because `wl-copy` can hang in isolated sessions. Enable with `enable_clipboard=true` in `session_start`, and ensure `wl-clipboard` is installed.
+- **Clipboard requires opt-in** -- Clipboard tools and Unicode clipboard fallback are disabled by default for virtual sessions. Clipboard writes run an owned foreground helper and verify the selection before reporting success. Enable with `enable_clipboard=true` in `session_start`, and ensure `wl-clipboard` is installed.
 - **QMenu (native context menus) may not appear in AT-SPI2** -- Qt's AT-SPI2 bridge has incomplete support for popup menus on Wayland. Context menus may not be visible in `accessibility_tree` or `find_ui_elements`. Workaround: use `screenshot` to visually locate menu items and click by coordinates.
 - **Screen edge triggers do not work with EIS input** -- Auto-hide panels and layer-shell trigger strips rely on Wayland surface input routing, which may not respond to EIS-injected pointer events. Workaround: use `dbus_call` with KWin scripting or keyboard shortcuts instead.
 - **AT-SPI2 coordinates are surface-local, not screen-global** -- Wayland clients do not know their global screen position (by design). Coordinates returned by `find_ui_elements` and `accessibility_tree` are relative to the window's top-left corner, not the virtual screen. For single-window scenarios this is usually fine; for multi-window layouts, combine with `screenshot` for absolute positioning.

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Require lifecycle tests to run through the tracked bubblewrap runner; refuse direct host pytest runs.
+- Make screenshot output directories explicit and close live-session D-Bus probes.
+- Remove shared screenshot-directory defaults and track directory ownership independently of session metadata; borrowed paths are never recursively removed.
+- Observe exited process-group leaders without reaping until group cleanup finishes, preventing stale PID signalling.
+- Require absolute Wayland socket paths for foreign live D-Bus sessions.
+- Route `keyboard_type_unicode` through the selected Wayland session; enforce clipboard opt-in and own/verify foreground clipboard helpers.
+- Stop launched application process groups in virtual and live sessions, including termination-resistant descendants; clean up on CLI exit and MCP stdio disconnect.
+- Bound virtual-session startup, preserve existing sockets, and clean up failed startup and EIS initialization.
+- Refresh locked dependencies and require a patched MCP 1.x SDK.
+
+### Changed
+- Add configurable application shutdown grace to `session_stop` (default5 seconds, range0–60).
+- Document that virtual sessions and temporary HOME directories are not filesystem or network sandboxes; add lifecycle regression tests.
+
 ### Fixed
 
 - Segfault on Python 3.14 caused by missing `argtypes` on variadic `ei_seat_bind_capabilities` ctypes call
